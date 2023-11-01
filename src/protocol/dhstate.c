@@ -76,7 +76,7 @@ int noise_dhstate_new_by_id(NoiseDHState **state, int id)
     case NOISE_DH_CURVE25519:
         *state = noise_curve25519_new();
         break;
-
+#if 0
     case NOISE_DH_CURVE448:
         *state = noise_curve448_new();
         break;
@@ -84,7 +84,7 @@ int noise_dhstate_new_by_id(NoiseDHState **state, int id)
     case NOISE_DH_NEWHOPE:
         *state = noise_newhope_new();
         break;
-
+#endif
     default:
         return NOISE_ERROR_UNKNOWN_ID;
     }

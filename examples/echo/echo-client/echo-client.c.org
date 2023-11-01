@@ -27,43 +27,18 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
-#if defined(__WIN32__) || defined(WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef int socklen_t;
-typedef BOOL sockopt_type;
-#define MSG_NOSIGNAL 0
-#undef HAVE_POLL
-#endif
-
-#define short_options "k:vf"
-
-static const char *protocol = "Noise_KK_25519_ChaChaPoly_BLAKE2b";
-static const char *server_private_key = "B321CA343B77CFF728F6F5346F360E54CE4C3CB50ACDE0C4D7EF88CC288C14C6";
-static const char *client_public_key = "FA0DBBF96EE194CD49325A7AEFD52EABE6D638A17A60CA4796C4F08A92221F6C";
-
-static struct option const long_options[] = {
-    {"key-dir", required_argument, NULL, 'k'},
-    {"verbose", no_argument, NULL, 'v'},
-    {"fixed-ephemeral", no_argument, NULL, 'f'},
-    {NULL, 0, NULL, 0}};
 
 /* Parsed command-line options */
-static const char *key_dir = ".";
+static const char *client_private_key = "234D30626FA21534A56A7DDF825357DD3637E1BFBB8C4FB714BE935C8795655D";
+static const char *server_public_key = "704A34B610576F037D44E53DF80D52B40307ECC04523DA06BE8599DB111B6523";
+//Noise_KK_25519_ChaChaPoly_BLAKE2b
+static const char *protocol = "Noise_KK_25519_ChaChaPoly_BLAKE2b";
+static const char *hostname = "127.0.0.1";
 static int port = 7000;
-static int fixed_ephemeral = 0;
-
-/* Loaded keys */
-#define CURVE25519_KEY_LEN 32
-#define CURVE448_KEY_LEN 56
-static uint8_t client_key_25519[CURVE25519_KEY_LEN];
-static uint8_t server_key_25519[CURVE25519_KEY_LEN];
-static uint8_t client_key_448[CURVE448_KEY_LEN];
-static uint8_t server_key_448[CURVE448_KEY_LEN];
-static uint8_t psk[32];
+static int padding = 0;
 
 /* Message buffer for send/receive */
-#define MAX_MESSAGE_LEN 65535
+#define MAX_MESSAGE_LEN 4096
 static uint8_t message[MAX_MESSAGE_LEN + 2];
 
 void hex2bytes(char *hexstring, char *bytearray, int length)
@@ -72,16 +47,14 @@ void hex2bytes(char *hexstring, char *bytearray, int length)
         bytearray[i] = (hexstring[j] % 32 + 9) % 25 * 16 + (hexstring[j + 1] % 32 + 9) % 25;
 }
 
-/* Initializes the handshake with all necessary keys */
-static int initialize_handshake(NoiseHandshakeState *handshake,
-                                //const NoiseProtocolId *nid,
-                                const void *prologue, size_t prologue_len)
+/* Initialize the handshake using command-line options */
+static int initialize_handshake(NoiseHandshakeState *handshake, const void *prologue, size_t prologue_len)
 {
     NoiseDHState *dh;
-    int dh_id;
-    int err = NOISE_ERROR_NONE;
+    uint8_t *key = 0;
+    size_t key_len = 0;
+    int err;
 
-#if 0
     /* Set the prologue first */
     err = noise_handshakestate_set_prologue(handshake, prologue, prologue_len);
     if (err != NOISE_ERROR_NONE)
@@ -89,21 +62,26 @@ static int initialize_handshake(NoiseHandshakeState *handshake,
         noise_perror("prologue", err);
         return 0;
     }
-#endif
-    /* Set the local keypair for the server based on the DH algorithm */
+
+    /* Set the local keypair for the client */
     dh = noise_handshakestate_get_local_keypair_dh(handshake);
+    key_len = noise_dhstate_get_private_key_length(dh);
+    key = (uint8_t *)malloc(key_len);
+    if (!key)
+        return 0;
 
-    int key_len = noise_dhstate_get_private_key_length(dh);
-    char *key = (uint8_t *)malloc(key_len);
-
-    hex2bytes(server_private_key, key, key_len);
+    hex2bytes(client_private_key, key, key_len);
     noise_dhstate_set_keypair_private(dh, key, key_len);
-    //noise_free(key, key_len);
+    noise_free(key, key_len);
 
-    /* Set the remote public key for the client */
+    /* Set the remote public key for the server */
     dh = noise_handshakestate_get_remote_public_key_dh(handshake);
-    dh_id = noise_dhstate_get_dh_id(dh);
-    hex2bytes(client_public_key, key, key_len);
+    key_len = noise_dhstate_get_public_key_length(dh);
+    key = (uint8_t *)malloc(key_len);
+    if (!key)
+        return 0;
+
+    hex2bytes(server_public_key, key, key_len);
     err = noise_dhstate_set_public_key(dh, key, key_len);
     noise_free(key, key_len);
 
@@ -113,62 +91,60 @@ static int initialize_handshake(NoiseHandshakeState *handshake,
 
 int main(int argc, char *argv[])
 {
-    NoiseHandshakeState *handshake = 0;
+    NoiseHandshakeState *handshake;
     NoiseCipherState *send_cipher = 0;
     NoiseCipherState *recv_cipher = 0;
-    EchoProtocolId id;
-    NoiseProtocolId nid;
+    NoiseRandState *rand = 0;
     NoiseBuffer mbuf;
-    size_t message_size;
-    int fd;
-    int err;
-    int ok = 1;
+    EchoProtocolId id;
+    int err, ok;
     int action;
+    int fd;
+    size_t message_size;
+    size_t max_line_len;
 
     if (noise_init() != NOISE_ERROR_NONE)
     {
         fprintf(stderr, "Noise initialization failed\n");
         return 1;
     }
-#if (defined(__WIN32__) || defined(WIN32))
-    WORD wVersionRequested;
-    WSADATA wsaData;
-    int sock_err;
-    
-    wVersionRequested = MAKEWORD( 2, 2 );
-    
-    sock_err = WSAStartup( wVersionRequested, &wsaData );
-    if ( sock_err != 0 ) {
-        /* Tell the user that we could not find a usable */
-        /* WinSock DLL.                                  */
-        return;
-    }
-#endif
-    /* Accept an incoming connection */
-    fd = echo_accept(port);
 
+    /* Check that the echo protocol supports the handshake protocol.
+       One-way handshake patterns and XXfallback are not yet supported. */
     if (!echo_get_protocol_id(&id, protocol))
     {
         fprintf(stderr, "%s: not supported by the echo protocol\n", protocol);
-        return -1;
+        return 1;
     }
 
     /* Create a HandshakeState object for the protocol */
-    err = noise_handshakestate_new_by_name(&handshake, protocol, NOISE_ROLE_RESPONDER);
+    err = noise_handshakestate_new_by_name(&handshake, protocol, NOISE_ROLE_INITIATOR);
     if (err != NOISE_ERROR_NONE)
     {
         noise_perror(protocol, err);
-        return err;
+        return 1;
     }
 
-    /* Set all keys that are needed by the client's requested echo protocol */
-    if (ok)
+    /* Set the handshake options and verify that everything we need
+       has been supplied on the command-line. */
+    if (!initialize_handshake(handshake, &id, sizeof(id)))
     {
-        if (!initialize_handshake(handshake, &id, sizeof(id)))
-        {
-            ok = 0;
-        }
+        noise_handshakestate_free(handshake);
+        return 1;
     }
+
+    /* Attempt to connect to the remote party */
+    fd = echo_connect(hostname, port);
+    if (fd < 0)
+    {
+        noise_handshakestate_free(handshake);
+        return 1;
+    }
+
+    /* Send the echo protocol identifier to the server */
+    ok = 1;
+    if (!echo_send(fd, (const uint8_t *)&id, sizeof(id)))
+        ok = 0;
 
     /* Start the handshake */
     if (ok)
@@ -187,7 +163,6 @@ int main(int argc, char *argv[])
         action = noise_handshakestate_get_action(handshake);
         if (action == NOISE_ACTION_WRITE_MESSAGE)
         {
-            fprintf(stderr, "write");
             /* Write the next handshake message with a zero-length payload */
             noise_buffer_set_output(mbuf, message + 2, sizeof(message) - 2);
             err = noise_handshakestate_write_message(handshake, &mbuf, NULL);
@@ -207,10 +182,8 @@ int main(int argc, char *argv[])
         }
         else if (action == NOISE_ACTION_READ_MESSAGE)
         {
-
             /* Read the next handshake message and discard the payload */
             message_size = echo_recv(fd, message, sizeof(message));
-            fprintf(stderr,"read %d",message_size);
             if (!message_size)
             {
                 ok = 0;
@@ -227,7 +200,6 @@ int main(int argc, char *argv[])
         }
         else
         {
-            fprintf(stderr, "break");
             /* Either the handshake has finished or it has failed */
             break;
         }
@@ -254,26 +226,46 @@ int main(int argc, char *argv[])
     /* We no longer need the HandshakeState */
     noise_handshakestate_free(handshake);
     handshake = 0;
-    fprintf(stderr, "handshake done");
-    /* Process all incoming data packets and echo them back to the client */
-    while (ok)
-    {
-        /* Read the next message, including the two byte length prefix */
-        message_size = echo_recv(fd, message, sizeof(message));
-        if (!message_size)
-            break;
 
-        /* Decrypt the message */
-        noise_buffer_set_inout(mbuf, message + 2, message_size - 2, sizeof(message) - 2);
-        err = noise_cipherstate_decrypt(recv_cipher, &mbuf);
+    /* If we will be padding messages, we will need a random number generator */
+    if (ok && padding)
+    {
+        err = noise_randstate_new(&rand);
         if (err != NOISE_ERROR_NONE)
         {
-            noise_perror("read", err);
+            noise_perror("random number generator", err);
             ok = 0;
-            break;
+        }
+    }
+
+    /* Tell the user that the handshake has been successful */
+    if (ok)
+    {
+        printf("%s handshake complete.  Enter text to be echoed ...\n", protocol);
+    }
+
+    /* Read lines from stdin, send to the server, and wait for echoes */
+    max_line_len = sizeof(message) - 2 - noise_cipherstate_get_mac_length(send_cipher);
+    while (ok && fgets((char *)(message + 2), max_line_len, stdin))
+    {
+        /* Pad the message to a uniform size */
+        message_size = strlen((const char *)(message + 2));
+        if (padding)
+        {
+            err = noise_randstate_pad(rand, message + 2, message_size, max_line_len,
+                                      NOISE_PADDING_RANDOM);
+            if (err != NOISE_ERROR_NONE)
+            {
+                noise_perror("pad", err);
+                ok = 0;
+                break;
+            }
+            message_size = max_line_len;
         }
 
-        /* Re-encrypt it with the sending cipher and send back to the client */
+        /* Encrypt the message and send it */
+        noise_buffer_set_inout(mbuf, message + 2, message_size, sizeof(message) - 2);
+
         err = noise_cipherstate_encrypt(send_cipher, &mbuf);
         if (err != NOISE_ERROR_NONE)
         {
@@ -288,11 +280,47 @@ int main(int argc, char *argv[])
             ok = 0;
             break;
         }
+
+        /* Wait for a message from the server */
+        message_size = echo_recv(fd, message, sizeof(message));
+        if (!message_size)
+        {
+            fprintf(stderr, "Remote side terminated the connection\n");
+            ok = 0;
+            break;
+        }
+
+        /* Decrypt the incoming message */
+        noise_buffer_set_input(mbuf, message + 2, message_size - 2);
+        err = noise_cipherstate_decrypt(recv_cipher, &mbuf);
+        if (err != NOISE_ERROR_NONE)
+        {
+            noise_perror("read", err);
+            ok = 0;
+            break;
+        }
+
+        /* Remove padding from the message if necessary */
+        if (padding)
+        {
+            /* Find the first '\n' and strip everything after it */
+            const uint8_t *end = (const uint8_t *)
+                memchr(mbuf.data, '\n', mbuf.size);
+            if (end)
+                mbuf.size = end + 1 - mbuf.data;
+        }
+
+        /* Write the echo to standard output */
+        fputs("Received: ", stdout);
+        fwrite(mbuf.data, 1, mbuf.size, stdout);
     }
 
     /* Clean up and exit */
     noise_cipherstate_free(send_cipher);
     noise_cipherstate_free(recv_cipher);
+    noise_randstate_free(rand);
     echo_close(fd);
     return ok ? 0 : 1;
 }
+
+#include "echo-common.c"
